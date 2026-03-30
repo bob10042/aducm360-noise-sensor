@@ -49,21 +49,32 @@ def flash(bin_path):
     print('Chip running')
     session.close()
 
-    # Verify if it's the SWD firmware
-    if 'adc_swd' in bin_path:
-        import time
+    # Verify firmware_full is running
+    if 'firmware_full' in bin_path:
+        import time, subprocess
         time.sleep(2)
+        # Find g_dbg address from ELF
+        dbg_addr = 0x2000000C
+        elf = bin_path.replace('.bin', '.elf')
+        try:
+            out = subprocess.check_output(
+                ['arm-none-eabi-nm', elf], text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and parts[2] == 'g_dbg':
+                    dbg_addr = int(parts[0], 16)
+        except Exception:
+            pass
         try:
             session2 = ConnectHelper.session_with_chosen_probe(
-                target_override='cortex_m', connect_mode='attach')
+                target_override='cortex_m', connect_mode='attach',
+                options={'frequency': 100000})
             session2.open()
-            magic = session2.target.read32(0x20000010)
-            if magic == 0xCAFE1234:
-                print(f'Verified: firmware running (magic=0xCAFE1234)')
+            magic = session2.target.read32(dbg_addr)
+            if magic == 0xDEAD360F:
+                print(f'Verified: firmware_full running (magic=0xDEAD360F @ 0x{dbg_addr:08X})')
             else:
-                print(f'Warning: magic=0x{magic:08X} (expected 0xCAFE1234)')
-                print('  Addresses may have changed — recheck with:')
-                print('  arm-none-eabi-nm adc_swd.elf | grep g_magic')
+                print(f'Warning: magic=0x{magic:08X} at 0x{dbg_addr:08X} — firmware may still be booting')
             session2.close()
         except Exception as e:
             print(f'Verify skipped: {e}')

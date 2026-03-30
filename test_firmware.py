@@ -167,29 +167,9 @@ def main():
          d1['fw_version'] == FW_VERSION_EXPECT,
          f"got 0x{d1['fw_version']:08X}")
 
-    test('Boot complete flag',
-         d1['status_flags'] & (1 << 8),
-         f"flags=0x{d1['status_flags']:04X}")
-
-    test('ADC0 running flag',
-         d1['status_flags'] & (1 << 0),
-         f"flags=0x{d1['status_flags']:04X}")
-
-    test('ADC1 running flag',
-         d1['status_flags'] & (1 << 1),
-         f"flags=0x{d1['status_flags']:04X}")
-
-    test('DAC running flag',
-         d1['status_flags'] & (1 << 2),
-         f"flags=0x{d1['status_flags']:04X}")
-
-    test('Timer running flag',
-         d1['status_flags'] & (1 << 5),
-         f"flags=0x{d1['status_flags']:04X}")
-
-    test('WDT active flag',
-         d1['status_flags'] & (1 << 4),
-         f"flags=0x{d1['status_flags']:04X}")
+    test('All status flags',
+         (d1['status_flags'] & STS_ALL) == STS_ALL,
+         f"got 0x{d1['status_flags']:08X}, expected 0x{STS_ALL:08X}")
 
     test('ADC0 has samples',
          d1['adc0_count'] > 0,

@@ -140,6 +140,7 @@ static void uart_puts(const char *s) { while (*s) uart_putc(*s++); }
 static void uart_puti(int32_t v)
 {
     char buf[12]; int i = 0;
+    if (v == INT32_MIN) { uart_puts("-2147483648"); return; }
     if (v < 0) { uart_putc('-'); v = -v; }
     if (v == 0) { uart_putc('0'); return; }
     while (v > 0) { buf[i++] = '0' + (v % 10); v /= 10; }
@@ -382,10 +383,10 @@ void GP_Tmr0_Int_Handler(void)
 {
     GptClrInt(pADI_TM0, TSTA_TMOUT);
     g_dbg.tick_ms++;
-    g_dbg.timer_overflows++;
 
     if ((g_dbg.tick_ms % 1000) == 0) {
         g_dbg.uptime_sec++;
+        g_dbg.timer_overflows++;   /* counts 1-second boundaries */
 
         g_dbg.adc0_rate = g_dbg.adc0_count - s_adc0_count_prev;
         s_adc0_count_prev = g_dbg.adc0_count;
