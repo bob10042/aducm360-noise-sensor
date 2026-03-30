@@ -25,10 +25,10 @@ import time
 import subprocess
 
 MAGIC_EXPECT = 0xDEAD360F
-FW_VERSION_EXPECT = 0x00010000
+FW_VERSION_EXPECT = 0x00020000
 STRUCT_WORDS = 32
 
-# All expected status flags when fully booted
+# All expected status flags when fully booted (v2.0.0 adds SPI1 and GPIO)
 STS_ALL = (
     (1 << 0) |  # ADC0_RUNNING
     (1 << 1) |  # ADC1_RUNNING
@@ -36,7 +36,9 @@ STS_ALL = (
     (1 << 3) |  # UART_OK
     (1 << 4) |  # WDT_ACTIVE
     (1 << 5) |  # TIMER_RUNNING
-    (1 << 8)    # BOOT_COMPLETE
+    (1 << 8) |  # BOOT_COMPLETE
+    (1 << 9) |  # SPI1_READY
+    (1 << 10)   # GPIO_READY
 )
 
 def find_dbg_addr():
@@ -123,7 +125,8 @@ def main():
     # Connect
     print('\nConnecting SWD (attach mode)...')
     session = ConnectHelper.session_with_chosen_probe(
-        target_override='cortex_m', connect_mode='attach')
+        target_override='cortex_m', connect_mode='attach',
+        options={'frequency': 100000})
     session.open()
     target = session.target
 

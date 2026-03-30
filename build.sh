@@ -47,7 +47,7 @@ case $TARGET in
         MAIN="$SRC/adc_full.c"
         ;;
     firmware_full)
-        DEVICE_LIBS="$LIBS/src/ADuCM360/AdcLib.c $LIBS/src/ADuCM360/DioLib.c $LIBS/src/ADuCM360/DmaLib.c $LIBS/src/ADuCM360/DacLib.c $LIBS/src/ADuCM360/GptLib.c $LIBS/src/ADuCM360/WdtLib.c $LIBS/src/ADuCM360/UrtLib.c $LIBS/src/ADuCM360/ClkLib.c $LIBS/src/ADuCM360/IntLib.c $LIBS/src/ADuCM360/FeeLib.c"
+        DEVICE_LIBS="$LIBS/src/ADuCM360/AdcLib.c $LIBS/src/ADuCM360/DioLib.c $LIBS/src/ADuCM360/DmaLib.c $LIBS/src/ADuCM360/DacLib.c $LIBS/src/ADuCM360/GptLib.c $LIBS/src/ADuCM360/WdtLib.c $LIBS/src/ADuCM360/UrtLib.c $LIBS/src/ADuCM360/ClkLib.c $LIBS/src/ADuCM360/IntLib.c $LIBS/src/ADuCM360/FeeLib.c $LIBS/src/ADuCM360/SpiLib.c"
         MAIN="$SRC/firmware_full.c"
         ;;
     *)

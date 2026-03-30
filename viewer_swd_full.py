@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
-"""ADuCM360 Full Firmware Viewer — reads debug struct via SWD
+"""ADuCM360 Full Firmware Viewer v2.0 — reads debug struct via SWD
 
-Panels:
-  ADC0 waveform (noise/antenna) | ADC0 stats, ADC1 temp, DAC
-  UART loopback bar             | UART loopback stats, System
+Panels (left):
+  ADC0 noise waveform (AIN0)
+  AIN0-AIN11 live bar chart
+  UART loopback bar
+  ADC1 temperature waveform
+
+Panels (right):
+  ADC0 stats | ADC1 temp | DAC | UART loopback | GPIO | System
 
 Usage: python viewer_swd_full.py
 """
@@ -30,19 +35,20 @@ FONT_B = ('Consolas', 10, 'bold')
 FONT_L = ('Consolas', 12, 'bold')
 FONT_S = ('Consolas', 9)
 
-# ---- Addresses -------------------------------------------------------
-G_DBG_ADDR          = 0x2000000C
-MAGIC_EXPECT        = 0xDEAD360F
-STRUCT_WORDS        = 32
-UART_RX_COUNT_ADDR  = 0x20000098
-UART_RX_ERRORS_ADDR = 0x2000009C
+# ---- Default addresses (overridden from ELF when available) ----------
+G_DBG_ADDR_DEFAULT          = 0x2000000C
+G_AIN_ADDR_DEFAULT          = 0x20000090   # nm: g_ain
+UART_RX_COUNT_ADDR_DEFAULT  = 0x200000C8   # nm: g_uart_rx_count
+UART_RX_ERRORS_ADDR_DEFAULT = 0x200000CC   # nm: g_uart_rx_errors
+
+MAGIC_EXPECT = 0xDEAD360F
+STRUCT_WORDS = 32
 
 # ---- Temperature conversion (ADuCM360 28-bit ADC, internal ref 1.2V) -
-# AdcRd() full scale: 0x0FFFFFFF = +Vref.  Empirical: ~53.9M ≈ 22°C
 ADC1_FS   = 268435455.0
 ADC1_VREF = 1.2
-ADC1_V0   = 0.206     # voltage at 0°C (nominal)
-ADC1_TC   = 0.0016    # V/°C (1.6 mV/°C, nominal, ±5°C accuracy)
+ADC1_V0   = 0.206     # voltage at 0°C
+ADC1_TC   = 0.0016    # V/°C
 
 HISTORY_LEN = 400
 UPDATE_MS   = 80
@@ -55,6 +61,16 @@ STS_WDT_ACTIVE    = 1 << 4
 STS_TIMER_RUNNING = 1 << 5
 STS_CAL_VALID     = 1 << 6
 STS_BOOT_COMPLETE = 1 << 8
+STS_SPI1_READY    = 1 << 9
+STS_GPIO_READY    = 1 << 10
+
+AIN_COLORS = [
+    AMBER,   # AIN0 — noise antenna (highlighted)
+    GREEN, GREEN, GREEN,
+    CYAN,  CYAN,  CYAN,
+    BLUE,  BLUE,  BLUE,
+    PURPLE, PURPLE,
+]
 
 
 def s32(v):
@@ -75,9 +91,11 @@ class FullViewer:
         self.session = None
         self.target  = None
         self.running = False
-        self.dbg_addr = G_DBG_ADDR
+        self.dbg_addr        = G_DBG_ADDR_DEFAULT
+        self.ain_addr        = G_AIN_ADDR_DEFAULT
+        self.uart_rx_addr    = UART_RX_COUNT_ADDR_DEFAULT
+        self.uart_rx_err_addr= UART_RX_ERRORS_ADDR_DEFAULT
 
-        # Thread-safe data snapshot
         self._lock = threading.Lock()
         self._data = {}
 
@@ -87,26 +105,30 @@ class FullViewer:
         self.tx_hist   = collections.deque([0] * 60, maxlen=60)
         self.rx_hist   = collections.deque([0] * 60, maxlen=60)
 
+        # AIN snapshot (12 channels, updated each read)
+        self.ain_snap  = [0] * 12
+
         # UART rate tracking
         self._tx_prev   = 0
         self._rx_prev   = 0
         self._tx_rate   = 0
         self._rx_rate   = 0
         self._rate_t    = time.time()
-        self._init_uart = False   # set True once we seed prev from live counts
+        self._init_uart = False
 
-        root.title('ADuCM360 Firmware Dashboard — SWD')
+        root.title('ADuCM360 Firmware Dashboard v2.0 — SWD')
         root.configure(bg=BG)
-        root.geometry('1260x780')
-        root.minsize(1000, 600)
+        root.geometry('1260x860')
+        root.minsize(1000, 680)
 
         self._build_ui()
-        self._try_find_addr()
+        self._try_find_addrs()
         self._connect()
         self._draw()
 
     # ------------------------------------------------------------------
-    def _try_find_addr(self):
+    def _try_find_addrs(self):
+        """Read symbol addresses from firmware_full.elf via nm."""
         import subprocess, os
         elf = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            'firmware_full.elf')
@@ -115,10 +137,15 @@ class FullViewer:
         try:
             out = subprocess.check_output(
                 ['arm-none-eabi-nm', elf], text=True, stderr=subprocess.DEVNULL)
+            sym = {}
             for line in out.splitlines():
-                if 'g_dbg' in line:
-                    self.dbg_addr = int(line.split()[0], 16)
-                    return
+                parts = line.split()
+                if len(parts) >= 3:
+                    sym[parts[2]] = int(parts[0], 16)
+            if 'g_dbg'           in sym: self.dbg_addr         = sym['g_dbg']
+            if 'g_ain'           in sym: self.ain_addr          = sym['g_ain']
+            if 'g_uart_rx_count' in sym: self.uart_rx_addr      = sym['g_uart_rx_count']
+            if 'g_uart_rx_errors'in sym: self.uart_rx_err_addr  = sym['g_uart_rx_errors']
         except Exception:
             pass
 
@@ -146,52 +173,66 @@ class FullViewer:
         right.pack(side='right', fill='y', padx=(6, 0))
         right.pack_propagate(False)
 
-        # ---- Left: ADC0 noise waveform --------------------------------
+        # ---- Left: ADC0 noise waveform (AIN0) ----------------------
         tk.Label(left, text='ADC0 — Noise / Antenna (AIN0)',
-                 bg=BG, fg=GREEN, font=FONT_B).pack(anchor='w', padx=4)
-        self.cv_adc0 = tk.Canvas(left, bg=BG, highlightthickness=0, height=210)
+                 bg=BG, fg=AMBER, font=FONT_B).pack(anchor='w', padx=4)
+        self.cv_adc0 = tk.Canvas(left, bg=BG, highlightthickness=0, height=180)
         self.cv_adc0.pack(fill='both', expand=True, padx=2)
 
-        # ---- Left: UART loopback bar ---------------------------------
+        # ---- Left: AIN0-AIN11 live bar chart ------------------------
+        tk.Label(left, text='AIN0–AIN11 — Live Channels (round-robin)',
+                 bg=BG, fg=CYAN, font=FONT_B).pack(anchor='w', padx=4, pady=(6,0))
+        self.cv_ain = tk.Canvas(left, bg=BG, highlightthickness=0, height=160)
+        self.cv_ain.pack(fill='both', expand=True, padx=2)
+
+        # ---- Left: UART loopback bar --------------------------------
         tk.Label(left, text='UART Loopback  (TX → header wire → RX)',
-                 bg=BG, fg=AMBER, font=FONT_B).pack(anchor='w', padx=4, pady=(6,0))
-        self.cv_uart = tk.Canvas(left, bg=BG, highlightthickness=0, height=110)
+                 bg=BG, fg=GREEN, font=FONT_B).pack(anchor='w', padx=4, pady=(6,0))
+        self.cv_uart = tk.Canvas(left, bg=BG, highlightthickness=0, height=100)
         self.cv_uart.pack(fill='both', expand=True, padx=2)
 
-        # ---- Left: ADC1 temperature waveform -------------------------
-        tk.Label(left, text='ADC1 — Temperature (raw counts)',
+        # ---- Left: ADC1 temperature waveform -----------------------
+        tk.Label(left, text='ADC1 — Temperature (internal sensor)',
                  bg=BG, fg=BLUE, font=FONT_B).pack(anchor='w', padx=4, pady=(6,0))
-        self.cv_adc1 = tk.Canvas(left, bg=BG, highlightthickness=0, height=120)
+        self.cv_adc1 = tk.Canvas(left, bg=BG, highlightthickness=0, height=100)
         self.cv_adc1.pack(fill='both', expand=True, padx=2)
 
-        # ---- Right panels --------------------------------------------
+        # ---- Right panels -------------------------------------------
         # ADC0
-        f0 = self._panel(right, 'ADC0 — Antenna / Noise')
-        self.lbl_a0_val  = self._stat(f0, 'Now:',    GREEN)
-        self.lbl_a0_min  = self._stat(f0, 'Min:')
-        self.lbl_a0_max  = self._stat(f0, 'Max:')
-        self.lbl_a0_span = self._stat(f0, 'Span:',   CYAN)
-        self.lbl_a0_rate = self._stat(f0, 'Rate:')
-        self.lbl_a0_cnt  = self._stat(f0, 'Count:')
+        f0 = self._panel(right, 'ADC0 — Noise / Antenna')
+        self.lbl_a0_val   = self._stat(f0, 'Now:',   AMBER)
+        self.lbl_a0_chan  = self._stat(f0, 'Chan:',  CYAN)
+        self.lbl_a0_scans = self._stat(f0, 'Scans:')
+        self.lbl_a0_min   = self._stat(f0, 'Min:')
+        self.lbl_a0_max   = self._stat(f0, 'Max:')
+        self.lbl_a0_span  = self._stat(f0, 'Span:',  CYAN)
+        self.lbl_a0_rate  = self._stat(f0, 'Rate:')
+        self.lbl_a0_cnt   = self._stat(f0, 'Count:')
 
         # ADC1
         f1 = self._panel(right, 'ADC1 — Temperature')
-        self.lbl_a1_c    = self._stat(f1, 'Temp:',   CYAN)
-        self.lbl_a1_raw  = self._stat(f1, 'Raw:',    BLUE)
+        self.lbl_a1_c    = self._stat(f1, 'Temp:',  CYAN)
+        self.lbl_a1_raw  = self._stat(f1, 'Raw:',   BLUE)
         self.lbl_a1_rate = self._stat(f1, 'Rate:')
 
         # DAC
         fd = self._panel(right, 'DAC Output')
-        self.lbl_dac_val  = self._stat(fd, 'Value:', PURPLE)
+        self.lbl_dac_val = self._stat(fd, 'Value:', PURPLE)
         self.dac_bar = tk.Canvas(fd, bg='#21262d', highlightthickness=0, height=12)
         self.dac_bar.pack(fill='x', padx=4, pady=2)
 
         # UART loopback stats
         fl = self._panel(right, 'UART Loopback')
-        self.lbl_lb_tx   = self._stat(fl, 'TX:',     AMBER)
-        self.lbl_lb_rx   = self._stat(fl, 'RX:',     GREEN)
-        self.lbl_lb_pct  = self._stat(fl, 'Return:', CYAN)
-        self.lbl_lb_tot  = self._stat(fl, 'Total RX:')
+        self.lbl_lb_tx  = self._stat(fl, 'TX:',     AMBER)
+        self.lbl_lb_rx  = self._stat(fl, 'RX:',     GREEN)
+        self.lbl_lb_pct = self._stat(fl, 'Return:', CYAN)
+        self.lbl_lb_tot = self._stat(fl, 'Total RX:')
+
+        # GPIO
+        fg = self._panel(right, 'GPIO')
+        self.lbl_p0_out = self._stat(fg, 'P0 out:')
+        self.lbl_p1_in  = self._stat(fg, 'P1 in:',  GREEN)
+        self.lbl_p2_in  = self._stat(fg, 'P2 in:',  GREEN)
 
         # System
         fs = self._panel(right, 'System')
@@ -250,35 +291,39 @@ class FullViewer:
         try:
             from pyocd.core.helpers import ConnectHelper
             self.session = ConnectHelper.session_with_chosen_probe(
-                target_override='cortex_m', connect_mode='attach')
+                target_override='cortex_m', connect_mode='attach',
+                options={'frequency': 100000})
             self.session.open()
             self.target = self.session.target
 
             magic = self.target.read32(self.dbg_addr)
             if magic != MAGIC_EXPECT:
-                # Try scanning RAM
                 for off in range(0, 0x400, 4):
                     try:
                         if self.target.read32(0x20000000 + off) == MAGIC_EXPECT:
-                            self.dbg_addr = 0x20000000 + off
+                            delta = (0x20000000 + off) - self.dbg_addr
+                            self.dbg_addr         += delta
+                            self.ain_addr         += delta
+                            self.uart_rx_addr     += delta
+                            self.uart_rx_err_addr += delta
                             magic = MAGIC_EXPECT
                             break
                     except Exception:
                         break
 
             if magic == MAGIC_EXPECT:
-                # Seed UART rate counters from live values so first rate is 0
                 try:
                     words = self.target.read_memory_block32(self.dbg_addr, STRUCT_WORDS)
-                    self._tx_prev   = words[23]          # uart_tx_count
-                    self._rx_prev   = self.target.read32(UART_RX_COUNT_ADDR)
+                    self._tx_prev   = words[23]
+                    self._rx_prev   = self.target.read32(self.uart_rx_addr)
                     self._rate_t    = time.time()
                     self._init_uart = True
                 except Exception:
                     pass
 
                 self.lbl_conn.config(
-                    text=f'Connected  0x{self.dbg_addr:08X}', fg=GREEN)
+                    text=f'Connected  0x{self.dbg_addr:08X}  g_ain=0x{self.ain_addr:08X}',
+                    fg=GREEN)
                 self.running = True
                 threading.Thread(target=self._reader, daemon=True).start()
             else:
@@ -295,8 +340,11 @@ class FullViewer:
         while self.running:
             try:
                 words    = self.target.read_memory_block32(self.dbg_addr, STRUCT_WORDS)
-                rx_count = self.target.read32(UART_RX_COUNT_ADDR)
-                rx_errs  = self.target.read32(UART_RX_ERRORS_ADDR)
+                ain_raw  = self.target.read_memory_block32(self.ain_addr, 12)
+                rx_count = self.target.read32(self.uart_rx_addr)
+                rx_errs  = self.target.read32(self.uart_rx_err_addr)
+
+                ain_signed = [s32(w) for w in ain_raw]
 
                 d = {
                     'magic':        words[0],
@@ -313,15 +361,21 @@ class FullViewer:
                     'dac_val':      words[16],
                     'tick_ms':      words[18],
                     'wdt_pets':     words[20],
+                    'gpio_p0_out':  words[21],
                     'loop_count':   words[22],
                     'uart_tx':      words[23],
                     'cal_valid':    words[24],
                     'error_total':  words[26],
-                    'uart_rx':      rx_count,
-                    'uart_rx_errs': rx_errs,
+                    # v2.0.0 fields
+                    'adc0_chan':    words[28],
+                    'adc0_scans':  words[29],
+                    'gpio_p1_in':  words[30],
+                    'gpio_p2_in':  words[31],
+                    'ain':         ain_signed,
+                    'uart_rx':     rx_count,
+                    'uart_rx_errs':rx_errs,
                 }
 
-                # Compute UART rates once per second
                 now     = time.time()
                 elapsed = now - self._rate_t
                 if elapsed >= 1.0:
@@ -335,11 +389,10 @@ class FullViewer:
                     self._rate_t    = now
                     self._init_uart = True
 
-                # Update waveform histories
                 self.adc0_hist.append(s32(d['a0_raw']))
                 self.adc1_hist.append(s32(d['a1_raw']))
+                self.ain_snap = ain_signed
 
-                # Hand data to main thread
                 with self._lock:
                     self._data = d
 
@@ -356,7 +409,7 @@ class FullViewer:
     # ------------------------------------------------------------------
     def _update_ui(self):
         with self._lock:
-            d = dict(self._data)   # shallow copy — safe to read outside lock
+            d = dict(self._data)
         if not d:
             return
 
@@ -374,11 +427,13 @@ class FullViewer:
         a0_min = s32(d['a0_min'])
         a0_max = s32(d['a0_max'])
         span   = a0_max - a0_min
-        noise_color = RED if span > 1_000_000 else (AMBER if span > 100_000 else GREEN)
+        nc = RED if span > 1_000_000 else (AMBER if span > 100_000 else GREEN)
         self.lbl_a0_val.config(text=str(a0))
+        self.lbl_a0_chan.config(text=f"AIN{d['adc0_chan']}")
+        self.lbl_a0_scans.config(text=f"{d['adc0_scans']:,}")
         self.lbl_a0_min.config(text=str(a0_min))
         self.lbl_a0_max.config(text=str(a0_max))
-        self.lbl_a0_span.config(text=f'{span:,}', fg=noise_color)
+        self.lbl_a0_span.config(text=f'{span:,}', fg=nc)
         self.lbl_a0_rate.config(text=f"{d['a0_rate']} sps")
         self.lbl_a0_cnt.config(text=f"{d['a0_count']:,}")
 
@@ -410,6 +465,11 @@ class FullViewer:
             fg=GREEN if pct >= 75 else (AMBER if pct >= 30 else RED))
         self.lbl_lb_tot.config(text=f"{d['uart_rx']:,}")
 
+        # GPIO
+        self.lbl_p0_out.config(text=f"0x{d['gpio_p0_out']:02X}")
+        self.lbl_p1_in.config( text=f"0x{d['gpio_p1_in']:02X}")
+        self.lbl_p2_in.config( text=f"0x{d['gpio_p2_in']:02X}")
+
         # System
         self.lbl_uptime2.config(
             text=f"{up//3600:02d}:{(up%3600)//60:02d}:{up%60:02d}")
@@ -427,20 +487,23 @@ class FullViewer:
         if flags & STS_UART_OK:       fs.append('UART')
         if flags & STS_WDT_ACTIVE:    fs.append('WDT')
         if flags & STS_TIMER_RUNNING: fs.append('TMR')
+        if flags & STS_SPI1_READY:    fs.append('SPI1')
+        if flags & STS_GPIO_READY:    fs.append('GPIO')
         if flags & STS_BOOT_COMPLETE: fs.append('BOOT')
         self.lbl_flags.config(text=' '.join(fs))
 
     # ------------------------------------------------------------------
     def _draw(self):
-        self._draw_wave(self.cv_adc0, self.adc0_hist, GREEN)
+        self._draw_wave(self.cv_adc0, self.adc0_hist, AMBER)
         self._draw_wave(self.cv_adc1, self.adc1_hist, BLUE)
         self._draw_loopback(self.cv_uart)
+        self._draw_ain(self.cv_ain)
         self.root.after(UPDATE_MS, self._draw)
 
     def _draw_wave(self, canvas, history, color):
         canvas.delete('all')
         W = canvas.winfo_width()  or 600
-        H = canvas.winfo_height() or 180
+        H = canvas.winfo_height() or 160
         data = list(history)
         mn, mx = min(data), max(data)
         if mn == mx:
@@ -453,21 +516,16 @@ class FullViewer:
         def y(v):
             return H - int((v - mn) / (mx - mn) * H)
 
-        # Grid lines
         for i in range(1, 4):
             canvas.create_line(0, H*i//4, W, H*i//4, fill='#21262d')
-        # Zero line
         if mn < 0 < mx:
             canvas.create_line(0, y(0), W, y(0), fill='#484f58', dash=(4, 4))
 
-        # Waveform
         step = W / max(len(data) - 1, 1)
         pts  = [(int(i * step), y(v)) for i, v in enumerate(data)]
         if len(pts) > 1:
-            canvas.create_line(*[c for p in pts for c in p],
-                               fill=color, width=1)
+            canvas.create_line(*[c for p in pts for c in p], fill=color, width=1)
 
-        # Scale labels
         canvas.create_text(4,    4,      text=f'{mx:,.0f}', anchor='nw',
                            fill=DIM,  font=FONT_S)
         canvas.create_text(4,    H - 14, text=f'{mn:,.0f}', anchor='nw',
@@ -476,11 +534,69 @@ class FullViewer:
             canvas.create_text(W - 4, 4, text=str(data[-1]), anchor='ne',
                                fill=color, font=FONT_B)
 
-    def _draw_loopback(self, canvas):
-        """Animated TX / RX bar chart showing byte flow per second."""
+    def _draw_ain(self, canvas):
+        """Bar chart: AIN0-AIN11 current values, centred on zero."""
         canvas.delete('all')
         W = canvas.winfo_width()  or 600
-        H = canvas.winfo_height() or 110
+        H = canvas.winfo_height() or 160
+
+        data = list(self.ain_snap)
+        if not data:
+            return
+
+        # Scale: symmetric, based on max absolute value
+        peak = max(abs(v) for v in data)
+        if peak < 1000:
+            peak = 1000
+
+        n      = 12
+        margin = 4
+        total  = W - 2 * margin
+        bar_w  = total / n
+        cy     = H // 2        # centre line
+        max_h  = cy - 18       # leave room for label at top
+
+        # Centre line
+        canvas.create_line(0, cy, W, cy, fill='#484f58')
+
+        for i, val in enumerate(data):
+            x0   = margin + int(i * bar_w) + 1
+            x1   = margin + int((i + 1) * bar_w) - 1
+            norm = val / peak                            # -1.0 .. +1.0
+            h    = int(abs(norm) * max_h)
+            col  = AIN_COLORS[i % len(AIN_COLORS)]
+
+            if val >= 0:
+                canvas.create_rectangle(x0, cy - h, x1, cy, fill=col, outline='')
+            else:
+                canvas.create_rectangle(x0, cy, x1, cy + h, fill=col, outline='')
+
+            # Channel label
+            canvas.create_text((x0 + x1) // 2, H - 10,
+                               text=str(i), fill=DIM, font=FONT_S)
+            # Value label (above positive, below negative)
+            vstr = f'{val/1e6:.1f}M' if abs(val) >= 500_000 else str(val)
+            if val >= 0:
+                ty = max(cy - h - 2, 2)
+                canvas.create_text((x0 + x1) // 2, ty,
+                                   text=vstr, fill=col, font=FONT_S, anchor='s')
+            else:
+                ty = min(cy + h + 2, H - 20)
+                canvas.create_text((x0 + x1) // 2, ty,
+                                   text=vstr, fill=col, font=FONT_S, anchor='n')
+
+        # Peak label
+        canvas.create_text(W - 4, 2,
+                           text=f'±{peak/1e6:.1f}M' if peak >= 500_000 else f'±{peak}',
+                           anchor='ne', fill=DIM, font=FONT_S)
+        # AIN0 annotation
+        canvas.create_text(margin + bar_w / 2, 2,
+                           text='AIN0', anchor='n', fill=AMBER, font=FONT_S)
+
+    def _draw_loopback(self, canvas):
+        canvas.delete('all')
+        W = canvas.winfo_width()  or 600
+        H = canvas.winfo_height() or 100
 
         tx_data = list(self.tx_hist)
         rx_data = list(self.rx_hist)
@@ -496,17 +612,13 @@ class FullViewer:
             x    = int(i * (bar_w + gap))
             h_tx = int(tx / peak * (H - 20))
             h_rx = int(rx / peak * (H - 20))
-
-            # TX bar (amber, full height reference)
             canvas.create_rectangle(x, H - 16 - h_tx, x + bar_w,
                                     H - 16, fill=AMBER, outline='')
-            # RX bar (green, overlaid)
             canvas.create_rectangle(x, H - 16 - h_rx, x + bar_w,
                                     H - 16, fill=GREEN, outline='',
                                     stipple='gray50')
 
-        # Legend
-        canvas.create_rectangle(4,  H - 13, 16, H - 3, fill=AMBER,  outline='')
+        canvas.create_rectangle(4,   H - 13, 16,  H - 3, fill=AMBER,  outline='')
         canvas.create_text(18, H - 8, text=f'TX {self._tx_rate:,} B/s',
                            anchor='w', fill=AMBER, font=FONT_S)
         canvas.create_rectangle(110, H - 13, 122, H - 3, fill=GREEN, outline='')
